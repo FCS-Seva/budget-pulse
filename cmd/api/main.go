@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"budgetpulse/internal/config"
+	"budgetpulse/internal/ledger"
 	natsclient "budgetpulse/internal/platform/nats"
 	"budgetpulse/internal/platform/postgres"
 )
@@ -32,7 +33,12 @@ func main() {
 	}
 	defer nc.Close()
 
+	ledgerRepo := ledger.NewRepository(db)
+	ledgerService := ledger.NewService(ledgerRepo)
+	ledgerHandler := ledger.NewHandler(ledgerService)
+
 	mux := http.NewServeMux()
+
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		pingCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
@@ -50,6 +56,8 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+
+	ledgerHandler.RegisterRoutes(mux)
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
