@@ -2,8 +2,12 @@ package ledger
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"strings"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -16,8 +20,70 @@ func NewRepository(db *pgxpool.Pool) *Repository {
 	return &Repository{db: db}
 }
 
-func (r *Repository) CreateTransaction(ctx context.Context, req CreateTransactionRequest) (Transaction, error) {
-	var tx Transaction
+func (r *Repository) CreateTransaction(ctx context.Context, req CreateTransactionRequest, idempotencyKey string) (Transaction, error) {
+	existing, found, err := r.getTransactionByIdempotencyKey(ctx, req.UserID, idempotencyKey)
+	if err != nil {
+		return Transaction{}, err
+	}
+	if found {
+		return existing, nil
+	}
+
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return Transaction{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	created, err := r.createTransactionTx(ctx, tx, req)
+	if err != nil {
+		return Transaction{}, err
+	}
+
+	responseBody, err := json.Marshal(created)
+	if err != nil {
+		return Transaction{}, err
+	}
+
+	_, err = tx.Exec(
+		ctx,
+		`
+		INSERT INTO idempotency_keys (
+			user_id,
+			idempotency_key,
+			response_status_code,
+			response_body
+		)
+		VALUES ($1, $2, $3, $4)
+		`,
+		req.UserID,
+		idempotencyKey,
+		httpStatusCreated,
+		responseBody,
+	)
+	if err != nil {
+		if isUniqueViolation(err) {
+			existing, found, getErr := r.getTransactionByIdempotencyKey(ctx, req.UserID, idempotencyKey)
+			if getErr != nil {
+				return Transaction{}, getErr
+			}
+			if found {
+				return existing, nil
+			}
+		}
+
+		return Transaction{}, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return Transaction{}, err
+	}
+
+	return created, nil
+}
+
+func (r *Repository) createTransactionTx(ctx context.Context, tx pgx.Tx, req CreateTransactionRequest) (Transaction, error) {
+	var result Transaction
 	var categoryID pgtype.Int8
 	var merchant pgtype.Text
 
@@ -57,7 +123,7 @@ func (r *Repository) CreateTransaction(ctx context.Context, req CreateTransactio
 		}
 	}
 
-	err := r.db.QueryRow(
+	err := tx.QueryRow(
 		ctx,
 		query,
 		req.UserID,
@@ -68,15 +134,15 @@ func (r *Repository) CreateTransaction(ctx context.Context, req CreateTransactio
 		merchantValue,
 		req.OccurredAt,
 	).Scan(
-		&tx.ID,
-		&tx.UserID,
-		&tx.Type,
-		&tx.Amount,
-		&tx.Currency,
+		&result.ID,
+		&result.UserID,
+		&result.Type,
+		&result.Amount,
+		&result.Currency,
 		&categoryID,
 		&merchant,
-		&tx.OccurredAt,
-		&tx.CreatedAt,
+		&result.OccurredAt,
+		&result.CreatedAt,
 	)
 	if err != nil {
 		return Transaction{}, err
@@ -84,15 +150,43 @@ func (r *Repository) CreateTransaction(ctx context.Context, req CreateTransactio
 
 	if categoryID.Valid {
 		value := categoryID.Int64
-		tx.CategoryID = &value
+		result.CategoryID = &value
 	}
 
 	if merchant.Valid {
 		value := merchant.String
-		tx.Merchant = &value
+		result.Merchant = &value
 	}
 
-	return tx, nil
+	return result, nil
+}
+
+func (r *Repository) getTransactionByIdempotencyKey(ctx context.Context, userID int64, idempotencyKey string) (Transaction, bool, error) {
+	var responseBody []byte
+
+	err := r.db.QueryRow(
+		ctx,
+		`
+		SELECT response_body
+		FROM idempotency_keys
+		WHERE user_id = $1 AND idempotency_key = $2
+		`,
+		userID,
+		idempotencyKey,
+	).Scan(&responseBody)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Transaction{}, false, nil
+		}
+		return Transaction{}, false, err
+	}
+
+	var tx Transaction
+	if err := json.Unmarshal(responseBody, &tx); err != nil {
+		return Transaction{}, false, err
+	}
+
+	return tx, true, nil
 }
 
 func (r *Repository) ListTransactions(ctx context.Context, userID int64) ([]Transaction, error) {
@@ -228,3 +322,10 @@ func (r *Repository) ListCategories(ctx context.Context, userID int64) ([]Catego
 
 	return result, nil
 }
+
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
+const httpStatusCreated = 201

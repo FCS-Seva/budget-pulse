@@ -1,6 +1,9 @@
 package ledger
 
-import "context"
+import (
+	"context"
+	"strings"
+)
 
 type Service struct {
 	repo *Repository
@@ -10,12 +13,17 @@ func NewService(repo *Repository) *Service {
 	return &Service{repo: repo}
 }
 
-func (s *Service) CreateTransaction(ctx context.Context, req CreateTransactionRequest) (Transaction, error) {
+func (s *Service) CreateTransaction(ctx context.Context, req CreateTransactionRequest, idempotencyKey string) (Transaction, error) {
 	if err := validateCreateTransactionRequest(req); err != nil {
 		return Transaction{}, err
 	}
 
-	return s.repo.CreateTransaction(ctx, req)
+	idempotencyKey = strings.TrimSpace(idempotencyKey)
+	if idempotencyKey == "" {
+		return Transaction{}, ValidationError{Message: "Idempotency-Key header is required"}
+	}
+
+	return s.repo.CreateTransaction(ctx, req, idempotencyKey)
 }
 
 func (s *Service) ListTransactions(ctx context.Context, userID int64) ([]Transaction, error) {

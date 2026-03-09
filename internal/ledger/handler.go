@@ -50,7 +50,7 @@ func (h *Handler) createTransaction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tx, err := h.service.CreateTransaction(r.Context(), req)
+	tx, err := h.service.CreateTransaction(r.Context(), req, r.Header.Get("Idempotency-Key"))
 	if err != nil {
 		var validationErr ValidationError
 		if errors.As(err, &validationErr) {
