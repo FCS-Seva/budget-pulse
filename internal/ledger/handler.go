@@ -45,12 +45,15 @@ func (h *Handler) handleCategories(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) createTransaction(w http.ResponseWriter, r *http.Request) {
 	var req CreateTransactionRequest
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+
+	if err := dec.Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
 
-	tx, err := h.service.CreateTransaction(r.Context(), req, r.Header.Get("Idempotency-Key"))
+	tx, replayed, err := h.service.CreateTransaction(r.Context(), req, r.Header.Get("Idempotency-Key"))
 	if err != nil {
 		var validationErr ValidationError
 		if errors.As(err, &validationErr) {
@@ -58,7 +61,18 @@ func (h *Handler) createTransaction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		var conflictErr ConflictError
+		if errors.As(err, &conflictErr) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": conflictErr.Message})
+			return
+		}
+
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+
+	if replayed {
+		writeJSON(w, http.StatusOK, tx)
 		return
 	}
 
@@ -96,7 +110,10 @@ func (h *Handler) listTransactions(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) createCategory(w http.ResponseWriter, r *http.Request) {
 	var req CreateCategoryRequest
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+
+	if err := dec.Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
@@ -106,6 +123,12 @@ func (h *Handler) createCategory(w http.ResponseWriter, r *http.Request) {
 		var validationErr ValidationError
 		if errors.As(err, &validationErr) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": validationErr.Message})
+			return
+		}
+
+		var conflictErr ConflictError
+		if errors.As(err, &conflictErr) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": conflictErr.Message})
 			return
 		}
 

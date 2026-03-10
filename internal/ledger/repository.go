@@ -6,6 +6,8 @@ import (
 	"errors"
 	"strings"
 
+	"budgetpulse/internal/outbox"
+
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -16,70 +18,106 @@ type Repository struct {
 	db *pgxpool.Pool
 }
 
+type idempotencyRecord struct {
+	RequestHash  string
+	ResponseBody []byte
+}
+
 func NewRepository(db *pgxpool.Pool) *Repository {
 	return &Repository{db: db}
 }
 
-func (r *Repository) CreateTransaction(ctx context.Context, req CreateTransactionRequest, idempotencyKey string) (Transaction, error) {
-	existing, found, err := r.getTransactionByIdempotencyKey(ctx, req.UserID, idempotencyKey)
+func (r *Repository) CreateTransaction(ctx context.Context, req CreateTransactionRequest, idempotencyKey, requestHash string) (Transaction, bool, error) {
+	rec, found, err := r.getTransactionByIdempotencyKey(ctx, req.UserID, idempotencyKey)
 	if err != nil {
-		return Transaction{}, err
+		return Transaction{}, false, err
 	}
+
 	if found {
-		return existing, nil
+		if rec.RequestHash != requestHash {
+			return Transaction{}, false, ConflictError{Message: "Idempotency-Key is already used with different payload"}
+		}
+
+		tx, err := decodeStoredTransaction(rec.ResponseBody)
+		if err != nil {
+			return Transaction{}, false, err
+		}
+
+		return tx, true, nil
 	}
 
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
-		return Transaction{}, err
+		return Transaction{}, false, err
 	}
 	defer tx.Rollback(ctx)
 
+	if req.CategoryID != nil {
+		ok, err := r.categoryExistsForUserTx(ctx, tx, req.UserID, *req.CategoryID)
+		if err != nil {
+			return Transaction{}, false, err
+		}
+		if !ok {
+			return Transaction{}, false, ValidationError{Message: "category_id does not belong to user"}
+		}
+	}
+
 	created, err := r.createTransactionTx(ctx, tx, req)
 	if err != nil {
-		return Transaction{}, err
+		return Transaction{}, false, err
+	}
+
+	event, err := newTransactionCreatedEvent(created)
+	if err != nil {
+		return Transaction{}, false, err
+	}
+
+	if err := r.insertOutboxEventTx(ctx, tx, event); err != nil {
+		return Transaction{}, false, err
 	}
 
 	responseBody, err := json.Marshal(created)
 	if err != nil {
-		return Transaction{}, err
+		return Transaction{}, false, err
 	}
 
-	_, err = tx.Exec(
+	err = r.saveIdempotencyKeyTx(
 		ctx,
-		`
-		INSERT INTO idempotency_keys (
-			user_id,
-			idempotency_key,
-			response_status_code,
-			response_body
-		)
-		VALUES ($1, $2, $3, $4)
-		`,
+		tx,
 		req.UserID,
 		idempotencyKey,
+		requestHash,
 		httpStatusCreated,
 		responseBody,
 	)
 	if err != nil {
 		if isUniqueViolation(err) {
-			existing, found, getErr := r.getTransactionByIdempotencyKey(ctx, req.UserID, idempotencyKey)
+			rec, found, getErr := r.getTransactionByIdempotencyKey(ctx, req.UserID, idempotencyKey)
 			if getErr != nil {
-				return Transaction{}, getErr
+				return Transaction{}, false, getErr
 			}
 			if found {
-				return existing, nil
+				if rec.RequestHash != requestHash {
+					return Transaction{}, false, ConflictError{Message: "Idempotency-Key is already used with different payload"}
+				}
+
+				tx, err := decodeStoredTransaction(rec.ResponseBody)
+				if err != nil {
+					return Transaction{}, false, err
+				}
+
+				return tx, true, nil
 			}
 		}
 
-		return Transaction{}, err
+		return Transaction{}, false, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return Transaction{}, err
+		return Transaction{}, false, err
 	}
 
-	return created, nil
+	return created, false, nil
 }
 
 func (r *Repository) createTransactionTx(ctx context.Context, tx pgx.Tx, req CreateTransactionRequest) (Transaction, error) {
@@ -145,6 +183,9 @@ func (r *Repository) createTransactionTx(ctx context.Context, tx pgx.Tx, req Cre
 		&result.CreatedAt,
 	)
 	if err != nil {
+		if isForeignKeyViolation(err) {
+			return Transaction{}, ValidationError{Message: "invalid category_id"}
+		}
 		return Transaction{}, err
 	}
 
@@ -161,32 +202,71 @@ func (r *Repository) createTransactionTx(ctx context.Context, tx pgx.Tx, req Cre
 	return result, nil
 }
 
-func (r *Repository) getTransactionByIdempotencyKey(ctx context.Context, userID int64, idempotencyKey string) (Transaction, bool, error) {
-	var responseBody []byte
+func (r *Repository) insertOutboxEventTx(ctx context.Context, tx pgx.Tx, event outbox.Event) error {
+	_, err := tx.Exec(
+		ctx,
+		`
+		INSERT INTO outbox_events (
+			event_id,
+			event_type,
+			payload,
+			status
+		)
+		VALUES ($1, $2, $3, $4)
+		`,
+		event.EventID,
+		event.EventType,
+		event.Payload,
+		event.Status,
+	)
+
+	return err
+}
+
+func (r *Repository) saveIdempotencyKeyTx(ctx context.Context, tx pgx.Tx, userID int64, idempotencyKey, requestHash string, responseStatusCode int, responseBody []byte) error {
+	_, err := tx.Exec(
+		ctx,
+		`
+		INSERT INTO idempotency_keys (
+			user_id,
+			idempotency_key,
+			request_hash,
+			response_status_code,
+			response_body
+		)
+		VALUES ($1, $2, $3, $4, $5)
+		`,
+		userID,
+		idempotencyKey,
+		requestHash,
+		responseStatusCode,
+		responseBody,
+	)
+
+	return err
+}
+
+func (r *Repository) getTransactionByIdempotencyKey(ctx context.Context, userID int64, idempotencyKey string) (idempotencyRecord, bool, error) {
+	var rec idempotencyRecord
 
 	err := r.db.QueryRow(
 		ctx,
 		`
-		SELECT response_body
+		SELECT request_hash, response_body
 		FROM idempotency_keys
 		WHERE user_id = $1 AND idempotency_key = $2
 		`,
 		userID,
 		idempotencyKey,
-	).Scan(&responseBody)
+	).Scan(&rec.RequestHash, &rec.ResponseBody)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return Transaction{}, false, nil
+			return idempotencyRecord{}, false, nil
 		}
-		return Transaction{}, false, err
+		return idempotencyRecord{}, false, err
 	}
 
-	var tx Transaction
-	if err := json.Unmarshal(responseBody, &tx); err != nil {
-		return Transaction{}, false, err
-	}
-
-	return tx, true, nil
+	return rec, true, nil
 }
 
 func (r *Repository) ListTransactions(ctx context.Context, userID int64) ([]Transaction, error) {
@@ -275,6 +355,9 @@ func (r *Repository) CreateCategory(ctx context.Context, req CreateCategoryReque
 		&category.CreatedAt,
 	)
 	if err != nil {
+		if isUniqueViolation(err) {
+			return Category{}, ConflictError{Message: "category already exists"}
+		}
 		return Category{}, err
 	}
 
@@ -323,9 +406,44 @@ func (r *Repository) ListCategories(ctx context.Context, userID int64) ([]Catego
 	return result, nil
 }
 
+func (r *Repository) categoryExistsForUserTx(ctx context.Context, tx pgx.Tx, userID, categoryID int64) (bool, error) {
+	var exists bool
+
+	err := tx.QueryRow(
+		ctx,
+		`
+		SELECT EXISTS(
+			SELECT 1
+			FROM categories
+			WHERE id = $1 AND user_id = $2
+		)
+		`,
+		categoryID,
+		userID,
+	).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+
+	return exists, nil
+}
+
+func isForeignKeyViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23503"
+}
+
 func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
+func decodeStoredTransaction(body []byte) (Transaction, error) {
+	var tx Transaction
+	if err := json.Unmarshal(body, &tx); err != nil {
+		return Transaction{}, err
+	}
+	return tx, nil
 }
 
 const httpStatusCreated = 201
