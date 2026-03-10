@@ -17,16 +17,10 @@ func NewRepository(db *pgxpool.Pool) *Repository {
 	return &Repository{db: db}
 }
 
-func (r *Repository) ApplyExpenseTransaction(ctx context.Context, event TransactionCreatedEvent) error {
-	if event.CategoryID == nil {
-		return nil
-	}
-
-	periodStart := monthStart(event.OccurredAt)
-
+func (r *Repository) ApplyTransactionCreated(ctx context.Context, event TransactionCreatedEvent) (bool, error) {
 	dbtx, err := r.db.Begin(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	done := false
@@ -35,6 +29,26 @@ func (r *Repository) ApplyExpenseTransaction(ctx context.Context, event Transact
 			_ = dbtx.Rollback(ctx)
 		}
 	}()
+
+	inserted, err := r.insertProcessedEventTx(ctx, dbtx, event.EventID)
+	if err != nil {
+		return false, err
+	}
+	if !inserted {
+		done = true
+		_ = dbtx.Rollback(ctx)
+		return false, nil
+	}
+
+	if event.Type != "expense" || event.CategoryID == nil {
+		if err := dbtx.Commit(ctx); err != nil {
+			return false, err
+		}
+		done = true
+		return true, nil
+	}
+
+	periodStart := monthStart(event.OccurredAt)
 
 	var limitAmount string
 	err = dbtx.QueryRow(
@@ -53,11 +67,13 @@ func (r *Repository) ApplyExpenseTransaction(ctx context.Context, event Transact
 	).Scan(&limitAmount)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
+			if err := dbtx.Commit(ctx); err != nil {
+				return false, err
+			}
 			done = true
-			_ = dbtx.Rollback(ctx)
-			return nil
+			return true, nil
 		}
-		return err
+		return false, err
 	}
 
 	_, err = dbtx.Exec(
@@ -86,15 +102,38 @@ func (r *Repository) ApplyExpenseTransaction(ctx context.Context, event Transact
 		limitAmount,
 	)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	if err := dbtx.Commit(ctx); err != nil {
-		return err
+		return false, err
 	}
 
 	done = true
-	return nil
+	return true, nil
+}
+
+func (r *Repository) insertProcessedEventTx(ctx context.Context, dbtx pgx.Tx, eventID string) (bool, error) {
+	var insertedEventID string
+
+	err := dbtx.QueryRow(
+		ctx,
+		`
+		INSERT INTO processed_events (event_id)
+		VALUES ($1)
+		ON CONFLICT DO NOTHING
+		RETURNING event_id
+		`,
+		eventID,
+	).Scan(&insertedEventID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	return true, nil
 }
 
 func monthStart(t time.Time) time.Time {

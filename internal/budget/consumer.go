@@ -44,17 +44,8 @@ func (c *Consumer) Run(ctx context.Context) error {
 			return
 		}
 
-		if event.Type != "expense" {
-			_ = msg.Ack()
-			return
-		}
-
-		if event.CategoryID == nil {
-			_ = msg.Ack()
-			return
-		}
-
-		if err := c.repo.ApplyExpenseTransaction(processCtx, event); err != nil {
+		_, err := c.repo.ApplyTransactionCreated(processCtx, event)
+		if err != nil {
 			log.Printf("budget consumer apply failed: %v", err)
 			_ = msg.Nak()
 			return
