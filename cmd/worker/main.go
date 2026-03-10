@@ -5,8 +5,10 @@ import (
 	"log"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"budgetpulse/internal/config"
+	"budgetpulse/internal/outbox"
 	natsclient "budgetpulse/internal/platform/nats"
 	"budgetpulse/internal/platform/postgres"
 )
@@ -29,9 +31,14 @@ func main() {
 	}
 	defer nc.Close()
 
+	outboxRepo := outbox.NewRepository(db)
+	publisher := outbox.NewPublisher(outboxRepo, nc.JetStream, time.Second)
+
 	log.Print("worker started")
 
-	<-ctx.Done()
+	if err := publisher.Run(ctx); err != nil {
+		log.Fatal(err)
+	}
 
 	log.Print("worker stopped")
 }

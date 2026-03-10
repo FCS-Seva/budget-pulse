@@ -7,4 +7,9 @@ type Event struct {
 	Status    string
 }
 
-const StatusPending = "pending"
+const (
+	StatusPending             = "pending"
+	StatusSent                = "sent"
+	StreamName                = "events"
+	SubjectTransactionCreated = "transaction.created"
+)
