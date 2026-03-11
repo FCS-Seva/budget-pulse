@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"budgetpulse/internal/budget"
 	"budgetpulse/internal/config"
 	"budgetpulse/internal/ledger"
 	natsclient "budgetpulse/internal/platform/nats"
@@ -37,6 +38,10 @@ func main() {
 	ledgerService := ledger.NewService(ledgerRepo)
 	ledgerHandler := ledger.NewHandler(ledgerService)
 
+	budgetRepo := budget.NewRepository(db)
+	budgetService := budget.NewService(budgetRepo)
+	budgetHandler := budget.NewHandler(budgetService)
+
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -58,6 +63,7 @@ func main() {
 	})
 
 	ledgerHandler.RegisterRoutes(mux)
+	budgetHandler.RegisterRoutes(mux)
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
