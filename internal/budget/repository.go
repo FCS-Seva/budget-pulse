@@ -3,6 +3,7 @@ package budget
 import (
 	"context"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -188,7 +189,30 @@ func (r *Repository) ApplyTransactionCreated(ctx context.Context, event Transact
 		return false, err
 	}
 
-	_, err = dbtx.Exec(
+	var prevSpent string
+	var prevRemaining string
+	err = dbtx.QueryRow(
+		ctx,
+		`
+		SELECT spent_amount::text, remaining_amount::text
+		FROM budget_stats
+		WHERE user_id = $1
+		  AND category_id = $2
+		  AND period_type = 'month'
+		  AND period_start = $3
+		FOR UPDATE
+		`,
+		event.UserID,
+		*event.CategoryID,
+		periodStart,
+	).Scan(&prevSpent, &prevRemaining)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return false, err
+	}
+
+	var spentAmount string
+	var remainingAmount string
+	err = dbtx.QueryRow(
 		ctx,
 		`
 		INSERT INTO budget_stats (
@@ -206,15 +230,36 @@ func (r *Repository) ApplyTransactionCreated(ctx context.Context, event Transact
 			spent_amount = budget_stats.spent_amount + EXCLUDED.spent_amount,
 			remaining_amount = $5::numeric - (budget_stats.spent_amount + EXCLUDED.spent_amount),
 			updated_at = NOW()
+		RETURNING spent_amount::text, remaining_amount::text
 		`,
 		event.UserID,
 		*event.CategoryID,
 		periodStart,
 		event.Amount,
 		limitAmount,
-	)
+	).Scan(&spentAmount, &remainingAmount)
 	if err != nil {
 		return false, err
+	}
+
+	prevExceeded := isExceeded(prevRemaining)
+	currentExceeded := isExceeded(remainingAmount)
+
+	if !prevExceeded && currentExceeded {
+		payload, err := newBudgetExceededNotificationPayload(
+			event,
+			periodStart,
+			limitAmount,
+			spentAmount,
+			remainingAmount,
+		)
+		if err != nil {
+			return false, err
+		}
+
+		if err := r.insertNotificationIfNotExistsTx(ctx, dbtx, event.UserID, *event.CategoryID, periodStart, payload); err != nil {
+			return false, err
+		}
 	}
 
 	if err := dbtx.Commit(ctx); err != nil {
@@ -248,6 +293,60 @@ func (r *Repository) insertProcessedEventTx(ctx context.Context, dbtx pgx.Tx, ev
 	return true, nil
 }
 
+func (r *Repository) insertNotificationIfNotExistsTx(
+	ctx context.Context,
+	dbtx pgx.Tx,
+	userID int64,
+	categoryID int64,
+	periodStart time.Time,
+	payload []byte,
+) error {
+	var exists bool
+
+	err := dbtx.QueryRow(
+		ctx,
+		`
+		SELECT EXISTS(
+			SELECT 1
+			FROM notifications
+			WHERE user_id = $1
+			  AND type = $2
+			  AND payload->> 'category_id' = $3
+			  AND payload->>'period_type' = 'month'
+			  AND payload->>'period_start' = $4
+		)
+		`,
+		userID,
+		NotificationTypeBudgetExceeded,
+		intToString(categoryID),
+		periodStart.Format(time.RFC3339),
+	).Scan(&exists)
+	if err != nil {
+		return err
+	}
+
+	if exists {
+		return nil
+	}
+
+	_, err = dbtx.Exec(
+		ctx,
+		`
+		INSERT INTO notifications (
+			user_id,
+			type,
+			payload
+		)
+		VALUES ($1, $2, $3)
+		`,
+		userID,
+		NotificationTypeBudgetExceeded,
+		payload,
+	)
+
+	return err
+}
+
 func (r *Repository) categoryExistsForUserTx(ctx context.Context, dbtx pgx.Tx, userID, categoryID int64) (bool, error) {
 	var exists bool
 
@@ -275,7 +374,15 @@ func monthStart(t time.Time) time.Time {
 	return time.Date(utc.Year(), utc.Month(), 1, 0, 0, 0, 0, time.UTC)
 }
 
+func isExceeded(remainingAmount string) bool {
+	return len(remainingAmount) > 0 && remainingAmount[0] == '-'
+}
+
 func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
+func intToString(v int64) string {
+	return strconv.FormatInt(v, 10)
 }
