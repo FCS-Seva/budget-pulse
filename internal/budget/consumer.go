@@ -3,7 +3,7 @@ package budget
 import (
 	"context"
 	"encoding/json"
-	"log"
+	"log/slog"
 	"time"
 
 	"budgetpulse/internal/outbox"
@@ -12,14 +12,16 @@ import (
 )
 
 type Consumer struct {
-	repo *Repository
-	js   jetstream.JetStream
+	repo   *Repository
+	js     jetstream.JetStream
+	logger *slog.Logger
 }
 
-func NewConsumer(repo *Repository, js jetstream.JetStream) *Consumer {
+func NewConsumer(repo *Repository, js jetstream.JetStream, logger *slog.Logger) *Consumer {
 	return &Consumer{
-		repo: repo,
-		js:   js,
+		repo:   repo,
+		js:     js,
+		logger: logger,
 	}
 }
 
@@ -33,23 +35,41 @@ func (c *Consumer) Run(ctx context.Context) error {
 		return err
 	}
 
+	c.logger.Info("budget consumer started", "durable", "budget-consumer", "subject", outbox.SubjectTransactionCreated)
+
 	cc, err := consumer.Consume(func(msg jetstream.Msg) {
 		processCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
 		var event TransactionCreatedEvent
 		if err := json.Unmarshal(msg.Data(), &event); err != nil {
-			log.Printf("budget consumer decode failed: %v", err)
+			c.logger.Error("budget consumer decode failed", "error", err)
 			_ = msg.Ack()
 			return
 		}
 
-		_, err := c.repo.ApplyTransactionCreated(processCtx, event)
+		processed, err := c.repo.ApplyTransactionCreated(processCtx, event)
 		if err != nil {
-			log.Printf("budget consumer apply failed: %v", err)
+			c.logger.Error(
+				"budget consumer apply failed",
+				"event_id", event.EventID,
+				"transaction_id", event.TransactionID,
+				"user_id", event.UserID,
+				"error", err,
+			)
 			_ = msg.Nak()
 			return
 		}
+
+		c.logger.Info(
+			"budget event processed",
+			"event_id", event.EventID,
+			"transaction_id", event.TransactionID,
+			"user_id", event.UserID,
+			"processed", processed,
+			"type", event.Type,
+			"category_id", event.CategoryID,
+		)
 
 		_ = msg.Ack()
 	})
@@ -59,5 +79,6 @@ func (c *Consumer) Run(ctx context.Context) error {
 	defer cc.Stop()
 
 	<-ctx.Done()
+	c.logger.Info("budget consumer stopped")
 	return nil
 }

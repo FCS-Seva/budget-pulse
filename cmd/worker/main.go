@@ -10,6 +10,7 @@ import (
 	"budgetpulse/internal/budget"
 	"budgetpulse/internal/config"
 	"budgetpulse/internal/outbox"
+	"budgetpulse/internal/platform/logging"
 	natsclient "budgetpulse/internal/platform/nats"
 	"budgetpulse/internal/platform/postgres"
 )
@@ -19,6 +20,7 @@ func main() {
 	defer stop()
 
 	cfg := config.Load()
+	logger := logging.NewLogger()
 
 	db, err := postgres.NewPool(ctx, cfg.PostgresURL)
 	if err != nil {
@@ -33,10 +35,10 @@ func main() {
 	defer nc.Close()
 
 	outboxRepo := outbox.NewRepository(db)
-	publisher := outbox.NewPublisher(outboxRepo, nc.JetStream, time.Second)
+	publisher := outbox.NewPublisher(outboxRepo, nc.JetStream, logger, time.Second)
 
 	budgetRepo := budget.NewRepository(db)
-	budgetConsumer := budget.NewConsumer(budgetRepo, nc.JetStream)
+	budgetConsumer := budget.NewConsumer(budgetRepo, nc.JetStream, logger)
 
 	errCh := make(chan error, 2)
 
@@ -52,7 +54,7 @@ func main() {
 		}
 	}()
 
-	log.Print("worker started")
+	logger.Info("worker started")
 
 	select {
 	case <-ctx.Done():
@@ -60,5 +62,5 @@ func main() {
 		log.Fatal(err)
 	}
 
-	log.Print("worker stopped")
+	logger.Info("worker stopped")
 }

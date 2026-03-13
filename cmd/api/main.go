@@ -12,8 +12,13 @@ import (
 	"budgetpulse/internal/budget"
 	"budgetpulse/internal/config"
 	"budgetpulse/internal/ledger"
+	"budgetpulse/internal/platform/logging"
+	"budgetpulse/internal/platform/metrics"
 	natsclient "budgetpulse/internal/platform/nats"
 	"budgetpulse/internal/platform/postgres"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -21,6 +26,7 @@ func main() {
 	defer stop()
 
 	cfg := config.Load()
+	logger := logging.NewLogger()
 
 	db, err := postgres.NewPool(ctx, cfg.PostgresURL)
 	if err != nil {
@@ -42,9 +48,13 @@ func main() {
 	budgetService := budget.NewService(budgetRepo)
 	budgetHandler := budget.NewHandler(budgetService)
 
-	mux := http.NewServeMux()
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
+	httpMetrics := metrics.NewHTTPMiddleware(reg)
 
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+	appMux := http.NewServeMux()
+
+	appMux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		pingCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
 
@@ -62,12 +72,26 @@ func main() {
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	ledgerHandler.RegisterRoutes(mux)
-	budgetHandler.RegisterRoutes(mux)
+	ledgerHandler.RegisterRoutes(appMux)
+	budgetHandler.RegisterRoutes(appMux)
+	appMux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+
+	handler := httpMetrics.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		appMux.ServeHTTP(w, r)
+		logger.Info(
+			"http request completed",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"query", r.URL.RawQuery,
+			"remote_addr", r.RemoteAddr,
+			"duration_ms", time.Since(start).Milliseconds(),
+		)
+	}))
 
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           mux,
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -80,11 +104,11 @@ func main() {
 		_ = server.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("api started on %s", cfg.HTTPAddr)
+	logger.Info("api started", "addr", cfg.HTTPAddr)
 
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
 
-	log.Print("api stopped")
+	logger.Info("api stopped")
 }
